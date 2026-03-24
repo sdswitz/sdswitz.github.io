@@ -5,6 +5,7 @@
 TEMPLATE="templates/post.html"
 POSTS_DIR="posts"
 POSTS_HTML="posts.html"
+HIDDEN="hidden-posts.txt"
 
 # Build each markdown post into HTML
 for md_file in "$POSTS_DIR"/*.md; do
@@ -36,6 +37,12 @@ HEADER
 # Collect posts with dates, sort by date descending
 for md_file in "$POSTS_DIR"/*.md; do
     [ -f "$md_file" ] || continue
+    filename=$(basename "$md_file")
+    # Skip hidden posts
+    if [ -f "$HIDDEN" ] && grep -qxF "$filename" "$HIDDEN"; then
+        echo "Skipping hidden post: $filename" >&2
+        continue
+    fi
     title=$(pandoc --template=templates/title.html "$md_file" -t html)
     date=$(pandoc --template=templates/date.html "$md_file" -t html)
     slug=$(basename "${md_file%.md}")
