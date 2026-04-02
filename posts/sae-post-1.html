@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SAE Project v1</title>
+    <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+    <nav>
+        <a href="../index.html">Home</a>
+        <a href="../posts.html">Posts</a>
+    </nav>
+    <h1>SAE Project v1</h1>
+    <div class="post-date">April 2, 2026</div>
+    <h1
+    id="first-pass-at-mechanistic-interpretability-with-a-sparse-autoencoder.">First
+    pass at mechanistic interpretability with a sparse autoencoder.</h1>
+    <h2 id="motivation">Motivation</h2>
+    <p>The black-box nature of transformer-based large language models
+    (LLMs) makes it quite difficult to understand how and why they
+    generate their output. It’s an area of research I’m very interested
+    in, and in this post I will detail my first attempt at training a
+    Sparse Autoencoder (SAE) from scratch along with some preliminary
+    results.</p>
+    <h2 id="setup">Setup</h2>
+    <h3 id="the-model">The model</h3>
+    <p>A basic autoencoder has two parts: an encoder that projects the
+    input vector down to a lower-dimensional vector, and then a decoder
+    that projects the lower-dimensional back to the original size. A
+    Sparse Autoencoder is different in that the intermediate vector
+    (I’ll refer to these as features) is typically larger than the input
+    vectors, and we add an L1 penalty during training to force these
+    features to be sparse. The “expansion factor” is what determines how
+    large the feature vectors are (feature size = embedding dimension x
+    expansion factor). Typical choices of the expansion factor are
+    powers of 2. After training, we look for features that are sparse
+    and activate on tokens in an identifiable way. For example, if one
+    of these features activates strongly on tokens like “Paris,”
+    “Angeles” or “Francisco,” we might infer that it’s capturing some
+    meaning about large cities.</p>
+    <p>In this project, the SAE takes 512-dimensional residual stream
+    activations as input, projects them up to a larger feature space,
+    applies a ReLU nonlinearity, and then reconstructs the original
+    activation vector. I trained several SAEs with different expansion
+    factors to see how the learned features changed with model
+    width.</p>
+    <p>Here is the PyTorch code for my Sparse Autoencoder:</p>
+    <pre><code>def SAEloss(xhat: torch.Tensor, x: torch.Tensor, f: torch.Tensor, lam: float = 1e-3) -&gt; torch.Tensor:
+    return F.mse_loss(xhat, x) + lam * f.abs().mean()
+
+class SparseAutoEncoder(nn.Module):
+    def __init__(self, d: int, m: int):
+        super().__init__()
+        self.b_pre = nn.Parameter(torch.zeros(d))
+        self.b_enc = nn.Parameter(torch.zeros(m))
+        self.W_enc = nn.Parameter(torch.nn.init.xavier_normal_(torch.empty(d, m)))
+        self.W_dec = nn.Parameter(torch.nn.init.xavier_normal_(torch.empty(m, d)))
+        self.renormalize_decoder()
+        self.act = nn.ReLU()
+
+    def renormalize_decoder(self) -&gt; None:
+        with torch.no_grad():
+            self.W_dec.data = self.W_dec.data / self.W_dec.data.norm(dim=1, keepdim=True).clamp_min(1e-12)
+
+    def encoder(self, x: torch.Tensor) -&gt; torch.Tensor:
+        x = x - self.b_pre
+        x = x @ self.W_enc
+        x = x + self.b_enc
+        x = self.act(x)
+        return x
+
+    def decoder(self, f: torch.Tensor) -&gt; torch.Tensor:
+        xhat = f @ self.W_dec
+        xhat = xhat + self.b_pre
+        return xhat
+
+    def forward(self, x: torch.Tensor) -&gt; tuple[torch.Tensor, torch.Tensor]:
+        f = self.encoder(x)
+        xhat = self.decoder(f)
+        return xhat, f</code></pre>
+    <h3 id="training">Training</h3>
+    <p>I used the Pythia-70m model as my baseline model to extract
+    features from, which has 512-dimensional embedding vectors. I then
+    pulled 50k pieces of text from OpenWebText and ran them through the
+    LLM, extracting activations from the residual stream of the third
+    layer at <code>blocks.3.hook_resid_post</code>. In total, this
+    produced about 5.88 million token-position activation vectors.</p>
+    <p>I trained 4 SAEs at expansion factors of 4, 8, 16 and 32. In each
+    model, I used a lambda of 3 in the L1 term of the loss function, a
+    learning rate of 3e-4, and trained for 50k steps. The training setup
+    also included a cosine learning rate schedule with a 2k-step warmup,
+    a warmup on the lambda term, gradient clipping, and decoder row
+    renormalization after each optimizer step.</p>
+    <p>Here are some training metrics for the 4x expansion model:</p>
+    <figure>
+    <img src="training_metrics_4x.png"
+    alt="Training metrics (4x SAE)" />
+    <figcaption aria-hidden="true">Training metrics (4x
+    SAE)</figcaption>
+    </figure>
+    <p>One of the practical challenges in this project was simply
+    handling the scale of the activation cache. The full activation
+    tensor is about 12GB on disk, so even on a relatively small baseline
+    model, the engineering side of the experiment mattered quite a
+    bit.</p>
+    <h3 id="ablation">Ablation</h3>
+    <p>Once we’ve identified a feature that appears to capture meaning
+    about something, the next step is to perform ablation on the
+    residual stream and see how it impacts the subsequent tokens
+    generated by the model. As a query passes through the layers of a
+    transformer-based LLM, the residual stream is where information
+    about the tokens from different layers is stored. When we ablate a
+    given feature, we are effectively removing the information that the
+    tokens for which the feature activates add to the residual
+    stream.</p>
+    <p>More specifically, I ablate a feature by encoding the residual
+    stream through the SAE, reconstructing that feature’s contribution
+    <code>f_i * W_dec[i]</code>, and subtracting it at
+    <code>blocks.3.hook_resid_post</code> (the residual stream of the
+    third layer). If the feature I ablated actually contains useful
+    information about the subject of the query, I’d expect the ablated
+    generation to differ from the unchanged model in either its token
+    probabilities or its generated output.</p>
+    <p>For this first pass, I focused mostly on single-feature ablations
+    and measured the KL divergence between the clean and ablated token
+    distributions, along with changes to the model’s top-5 next-token
+    predictions.</p>
+    <h3 id="what-worked">What worked</h3>
+    <p>I was able to successfully train 4 models at different expansion
+    factors and recover features with a clear pattern. In my 8x model, I
+    found a feature that detected the “Reuters” token, and in my 4x
+    model I found a feature that fired on tokens related to cities or
+    states.</p>
+    <p>I also found several other clean token-level features in the 8x
+    model, including a “Feb” detector and prefix-like features for
+    tokens such as <code>" un"</code> and <code>" re"</code>. These are
+    not deep semantic concepts, but they are good evidence that the SAE
+    is learning real structure from the residual stream rather than just
+    failing to train.</p>
+    <h3 id="what-didnt-work">What didn’t work</h3>
+    <p>The most interpretable features were often just token recognizers
+    and did not seem to capture any strong causal meaning.</p>
+    <p>That was the main disappointment in this first pass. The pipeline
+    could clearly recover recognizable features, but the features that
+    were easiest to interpret were often not the ones that most strongly
+    changed model behavior when ablated.</p>
+    <h2 id="interpretable-features">Interpretable Features</h2>
+    <h3 id="feature-1896">Feature 1896</h3>
+    <p>Here is an example of an interesting feature I found in my 4x
+    SAE. I was interested in features that corresponded to major cities
+    and found that feature 1896 corresponded to a lot of city- and
+    state-specific tokens. Some of its top activating examples included
+    tokens like <code>"Angeles"</code>, <code>"Georgia"</code>,
+    <code>"York"</code>, <code>"Vegas"</code>, <code>"Paris"</code>, and
+    <code>"Arizona"</code>.</p>
+    <p>(Note: this feature wasn’t very sparse but its top activating
+    tokens were all quite similar, which is why I wanted to see if it
+    had any causal importance.)</p>
+    <pre><code>Feature 1896 — top 10 activating tokens:
+
+  3.077  token=     &#39; Angeles&#39;   context: In the following days, stories about the discovery ran in local newspapers and o
+  2.990  token=     &#39; Angeles&#39;   context: Years ago, on a whim, a friend led me into a New Age bookstore in Los Angeles. A
+  2.974  token=     &#39; Georgia&#39;   context: ATLANTA - A Georgia factory worker claims in a federal lawsuit that he was fired
+  2.963  token=        &#39; York&#39;   context: On Thursday, a gay man was sentenced to up to 9 years in prison for assaulting a
+  2.960  token=        &#39; York&#39;   context: The other day I attended a reading by the Hungarian novelist László Krasznahorka
+  2.955  token=   &#39; Francisco&#39;   context: GI Bill&#39;s wording costs state&#39;s student vets EDUCATION
+
+Paul Miller poses for a 
+  2.950  token=       &#39; Vegas&#39;   context: c/o Lauren Billington
+
+It’s been three weeks since bleary-eyed Floridians woke u
+  2.934  token=     &#39; Arizona&#39;   context: A crowded in-store beer station at a Kroger-owned Fry’s Food Store in Arizona. (
+  2.930  token=       &#39; Paris&#39;   context: The French government suppressed testimony about brutal torture carried out by t
+  2.928  token=        &#39; York&#39;   context: The D.C. Forensic Sciences Department’s new glass-and-steel facility has been ho</code></pre>
+    <p>While the top-1 token after “ York” remained the same after
+    ablation, we can see that the distribution of the top-5 tokens is
+    slightly different. There are also small changes to the top-5
+    distribution for the second to last token, “ state.” We can also see
+    that the “ York” and “ state” tokens have the highest KL-divergences
+    between the original and ablated distributions.</p>
+    <pre><code>KL divergence per token:
+
+ 0   &lt;|endoftext|&gt;  KL=0.000000
+ 1             The  KL=0.000000
+ 2        governor  KL=0.000000
+ 3              of  KL=0.000000
+ 4             New  KL=0.000000
+ 5            York  KL=0.072997
+ 6       announced  KL=-0.000000
+ 7     legislation  KL=0.000000
+ 8              to  KL=0.000001
+ 9         improve  KL=0.000080
+10          public  KL=0.000004
+11  transportation  KL=0.000006
+12              in  KL=0.005954
+13             the  KL=0.005579
+14           state  KL=0.025738
+15               .  KL=0.000357
+
+Top-5 predictions (clean vs ablated):
+Position 5: &#39; York&#39;
+  Clean:   [&#39; City&#39;, &#39; is&#39;, &#39;,&#39;, &#39; has&#39;, &#39; State&#39;]
+  Ablated: [&#39; City&#39;, &#39; State&#39;, &#39; is&#39;, &#39; has&#39;, &#39; state&#39;]</code></pre>
+    <p>This is not a dramatic causal effect, but it is enough to suggest
+    that the feature is contributing some information related to place
+    names and geographic context.</p>
+    <h3 id="reuters-contrast">Reuters Contrast</h3>
+    <p>One of the most interpretable features in my 8x model was feature
+    3440, which only fired on <code>"Reuters"</code> tokens. This is one
+    of the clearest features in the model. However, after performing
+    ablation on it, I found that this feature had almost no causal
+    impact on token generation.</p>
+    <pre><code>KL divergence per token:
+
+ 0   &lt;|endoftext|&gt;  KL=0.000000
+ 1              In  KL=0.000000
+ 2               a  KL=0.000000
+ 3             new  KL=0.000000
+ 4          report  KL=0.000000
+ 5            from  KL=0.000000
+ 6         Reuters  KL=0.013324
+ 7               ,  KL=0.002602
+ 8             the  KL=0.000912
+ 9        governor  KL=0.000021
+10              of  KL=0.015196
+11             New  KL=0.000627
+12            York  KL=0.000229
+13                  KL=0.000001
+
+Top-5 predictions (clean vs ablated):
+Position 6: &#39; Reuters&#39;
+  Clean:   [&#39;,&#39;, &#39; on&#39;, &#39; that&#39;, &#39;/&#39;, &#39;:&#39;]
+  Ablated: [&#39;,&#39;, &#39; on&#39;, &#39; that&#39;, &#39; and&#39;, &#39;:&#39;]</code></pre>
+    <p>This was one of the more interesting results from the project.
+    The feature is highly interpretable, but it behaves more like a
+    recognizer than a driver of model behavior. In other words, it seems
+    to identify that a Reuters-style token is present without
+    contributing much to the model’s next-token predictions. Perhaps
+    this is because we are only looking at layer 3 and the LLM is not
+    yet considering complex relationships between tokens.</p>
+    <h2 id="additional-observations">Additional observations</h2>
+    <p>Beyond individual feature examples, I also looked at the decoder
+    geometry of the learned features by measuring pairwise cosine
+    similarity between decoder rows. In the 8x model, the maximum
+    off-diagonal similarity was about 0.80 and the mean similarity was
+    about 0.0015. In the 4x model, the maximum was about 0.90 and the
+    mean was about 0.0028.</p>
+    <p>These numbers suggest that most learned features are close to
+    orthogonal, but there are still a small number of highly similar
+    feature pairs. This is one reason I’m interested in doing more
+    systematic cross-expansion comparisons and multi-feature ablations
+    in the future.</p>
+    <h2 id="conclusion">Conclusion</h2>
+    <p>These findings suggest that while the individual ablations here
+    do not yet provide major interpretability breakthroughs, the SAE
+    recovers interpretable recognizer-like features. The baseline model
+    I’m using, Pythia-70m, is a very small model by today’s standards
+    and I was only looking at the third layer in the residual stream. A
+    larger baseline model would provide more coherent output to begin
+    with, and the early layers of any model capture more information
+    about grammar and spelling than semantic meaning between
+    concepts.</p>
+    <p>More broadly, this first pass gave me confidence that the
+    pipeline works: I can collect residual-stream activations, train
+    SAEs at multiple widths, recover interpretable features, inspect
+    their geometry, and intervene on them causally. What I have not yet
+    shown is that these features line up cleanly with the most
+    behaviorally important directions in the model.</p>
+    <p>My next steps are to try batch ablation, multi-feature ablation,
+    and compare features across expansions that capture similar
+    meanings.</p>
+    <h2 id="sources-and-references">Sources and references</h2>
+    <ul>
+    <li><a
+    href="https://adamkarvonen.github.io/machine_learning/2024/06/11/sae-intuitions.html">Article
+    on SAEs</a></li>
+    <li><a href="https://github.com/sdswitz/mech-int">Repository with
+    code</a></li>
+    </ul>
+    <a href="../posts.html" class="back-link">&larr; Back to posts</a>
+</body>
+</html>

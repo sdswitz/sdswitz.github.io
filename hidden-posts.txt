@@ -1,3 +1,4 @@
 # Add post filenames here (one per line) to hide them from the site.
 # The post HTML will still be built, but it won't appear on the posts listing.
 example-post.md
+old_sae-post-1.md
